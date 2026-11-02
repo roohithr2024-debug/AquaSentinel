@@ -1,0 +1,366 @@
+#include <DHT.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BMP280.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+
+// Wi-Fi
+const char* ssid = "Redmi Note 13 Pro 5G";
+const char* password = "12345678";
+
+// ThingSpeak
+const char* server = "http://api.thingspeak.com/update";
+String apiKey = "OP69QZXZU16XN4R9";
+
+// Pins
+#define RAIN_PIN 34
+#define BUZZER_PIN 26
+#define DHT_PIN 13
+#define LED_PIN 32
+#define DHT_TYPE DHT11
+
+// Sensors
+DHT dht_sensor(DHT_PIN, DHT_TYPE);
+Adafruit_BMP280 bmp;
+
+// Time
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 19800, 60000);
+
+// Timing
+unsigned long lastReading = 0;
+unsigned long lastUpload = 0;
+unsigned long lastBeep = 0;
+unsigned long rainStart = 0;
+unsigned long lastPressureCheck = 0;
+
+const unsigned long READ_INTERVAL = 30000;
+const unsigned long UPLOAD_INTERVAL = 30000;
+const unsigned long BEEP_INTERVAL = 1000;
+const unsigned long PRESSURE_INTERVAL = 300000;
+
+// Thresholds
+const int RAIN_THRESHOLD = 800;
+
+float previousPressure = 0;
+bool pressureBaselineReady = false;
+bool raining = false;
+bool buzzerState = false;
+
+int floodLikelihood = 0;
+int rainValue = 1023;
+
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  Serial.print("Connecting to Wi-Fi");
+
+  unsigned long start = millis();
+
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - start < 20000) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWi-Fi connected");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nWi-Fi connection failed");
+  }
+}
+
+int readRainSensor() {
+  long total = 0;
+
+  for (int i = 0; i < 10; i++) {
+    total += analogRead(RAIN_PIN);
+    delay(5);
+  }
+
+  return total / 10;
+}
+
+int calculateRisk(float humidity, float pressure,
+                  bool rainDetected,
+                  unsigned long rainDuration,
+                  bool pressureFalling) {
+  int score = 0;
+
+  // Rain detection
+  if (rainDetected) {
+    score += 45;
+
+    if (rainDuration >= 300000)
+      score += 25;
+    else if (rainDuration >= 120000)
+      score += 20;
+    else if (rainDuration >= 30000)
+      score += 15;
+  }
+
+  // Humidity
+  if (humidity >= 90)
+    score += 15;
+  else if (humidity >= 80)
+    score += 10;
+
+  // Atmospheric pressure
+  if (pressure < 995)
+    score += 15;
+  else if (pressure < 1000)
+    score += 10;
+
+  // Falling pressure trend
+  if (pressureFalling)
+    score += 10;
+
+  return constrain(score, 0, 100);
+}
+
+void updateBuzzer() {
+  if (floodLikelihood >= 70) {
+    if (millis() - lastBeep >= BEEP_INTERVAL) {
+      lastBeep = millis();
+      buzzerState = !buzzerState;
+      digitalWrite(BUZZER_PIN, buzzerState ? HIGH : LOW);
+    }
+  } else {
+    buzzerState = false;
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+}
+
+void uploadToThingSpeak(float temperature,
+                        float humidity,
+                        float pressure,
+                        int rain,
+                        float heatIndex) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Wi-Fi disconnected. Reconnecting...");
+    WiFi.reconnect();
+    return;
+  }
+
+  HTTPClient http;
+
+  String url = String(server) +
+    "?api_key=" + apiKey +
+    "&field1=" + String(temperature, 2) +
+    "&field2=" + String(humidity, 2) +
+    "&field3=" + String(pressure, 2) +
+    "&field4=" + String(rain) +
+    "&field5=" + String(floodLikelihood) +
+    "&field6=" + String(heatIndex) +
+    "&field7=" + String(raining ? 1 : 0);
+
+  http.setConnectTimeout(5000);
+  http.setTimeout(5000);
+
+  if (http.begin(url)) {
+    int httpCode = http.GET();
+
+    if (httpCode == HTTP_CODE_OK) {
+      String response = http.getString();
+      long entryID = response.toInt();
+
+      if (entryID > 0) {
+        Serial.print("ThingSpeak upload successful. Entry ID: ");
+        Serial.println(entryID);
+      } else {
+        Serial.println("ThingSpeak rejected the update.");
+        Serial.println("Check API key and upload interval.");
+      }
+    } else {
+      Serial.print("ThingSpeak HTTP error: ");
+      Serial.println(httpCode);
+
+      if (httpCode < 0) {
+        Serial.println(HTTPClient::errorToString(httpCode));
+      }
+    }
+
+    http.end();
+  } else {
+    Serial.println("Could not initialize HTTP connection");
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(LED_PIN, LOW);
+
+  analogReadResolution(10);
+
+  Wire.begin(21, 22);
+  dht_sensor.begin();
+
+  if (!bmp.begin(0x76) && !bmp.begin(0x77)) {
+    Serial.println("BMP280 not found. Check SDA, SCL and address.");
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  Serial.println("BMP280 initialized");
+
+  connectWiFi();
+
+  timeClient.begin();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    timeClient.update();
+  }
+
+  Serial.println("Flash Flood Monitoring Started");
+}
+
+void loop() {
+  timeClient.update();
+
+  unsigned long now = millis();
+
+  // Read sensors periodically
+  if (now - lastReading >= READ_INTERVAL ||
+      lastReading == 0) {
+    lastReading = now;
+
+    rainValue = readRainSensor();
+    raining = (rainValue < RAIN_THRESHOLD);
+
+    if (raining) {
+      if (rainStart == 0) {
+        rainStart = now;
+      }
+    } else {
+      rainStart = 0;
+    }
+
+    unsigned long rainDuration =
+      raining && rainStart != 0 ? now - rainStart : 0;
+
+    float temperature = dht_sensor.readTemperature();
+    float humidity = dht_sensor.readHumidity();
+    float pressure = bmp.readPressure() / 100.0F;
+
+    if (isnan(temperature) || isnan(humidity) ||
+        pressure <= 0) {
+      Serial.println("Sensor reading error. Check connections.");
+      return;
+    }
+
+    float heatIndex =
+      dht_sensor.computeHeatIndex(temperature, humidity, false);
+
+    bool pressureFalling = false;
+
+    if (!pressureBaselineReady) {
+      previousPressure = pressure;
+      lastPressureCheck = now;
+      pressureBaselineReady = true;
+    } else if (now - lastPressureCheck >= PRESSURE_INTERVAL) {
+      pressureFalling = (pressure < previousPressure - 1.5);
+
+      previousPressure = pressure;
+      lastPressureCheck = now;
+    }
+
+    floodLikelihood = calculateRisk(
+      humidity,
+      pressure,
+      raining,
+      rainDuration,
+      pressureFalling
+    );
+
+    // LED turns on for moderate or high risk
+    digitalWrite(LED_PIN,
+                 floodLikelihood >= 40 ? HIGH : LOW);
+
+    Serial.println("\n========== SENSOR READINGS ==========");
+    Serial.print("Time: ");
+    Serial.println(timeClient.getFormattedTime());
+
+    Serial.print("Rain Detected: ");
+    Serial.println(raining ? "YES" : "NO");
+
+    Serial.print("Rain Sensor Value: ");
+    Serial.println(rainValue);
+
+    Serial.print("Temperature: ");
+    Serial.print(temperature);
+    Serial.println(" C");
+
+    Serial.print("Humidity: ");
+    Serial.print(humidity);
+    Serial.println(" %");
+
+    Serial.print("Heat Index: ");
+    Serial.print(heatIndex);
+    Serial.println(" C");
+
+    Serial.print("Pressure: ");
+    Serial.print(pressure);
+    Serial.println(" hPa");
+
+    Serial.print("Rain Duration: ");
+    Serial.print(rainDuration / 1000);
+    Serial.println(" seconds");
+
+    Serial.print("Flood Risk Score: ");
+    Serial.print(floodLikelihood);
+    Serial.println(" / 100");
+
+    if (floodLikelihood >= 70) {
+      Serial.println("Risk Level: HIGH");
+    } else if (floodLikelihood >= 40) {
+      Serial.println("Risk Level: MODERATE");
+    } else {
+      Serial.println("Risk Level: LOW");
+    }
+
+    Serial.print("Flood Warning LED: ");
+    Serial.println(floodLikelihood >= 40 ? "ON" : "OFF");
+
+    Serial.println("=====================================");
+  }
+
+  // Repeated buzzer beeps at high risk
+  updateBuzzer();
+
+  // Upload at the configured interval
+  if (now - lastUpload >= UPLOAD_INTERVAL ||
+      lastUpload == 0) {
+    lastUpload = now;
+
+    float temperature = dht_sensor.readTemperature();
+    float humidity = dht_sensor.readHumidity();
+    float pressure = bmp.readPressure() / 100.0F;
+
+    if (!isnan(temperature) && !isnan(humidity) &&
+        pressure > 0) {
+      float heatIndex =
+        dht_sensor.computeHeatIndex(temperature, humidity, false);
+
+      uploadToThingSpeak(
+        temperature,
+        humidity,
+        pressure,
+        rainValue,
+        heatIndex
+      );
+    }
+  }
+
+  delay(10);
+}
