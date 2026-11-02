@@ -41,31 +41,8 @@ Key Features
 - NTP-based clock display using Indian Standard Time (UTC+05:30).
 - Non-blocking interval scheduling for the main monitoring tasks, apart from short sensor sampling and network operations.
 System Architecture
-The diagram below shows the main data path from sensing to local alerts and cloud monitoring.
-```mermaid
-flowchart TD
-    A[Rain Sensor] -->|Analog reading| B[ESP32]
-    C[DHT11] -->|Temperature and humidity| B
-    D[BMP280] -->|Atmospheric pressure| B
+<img width="1638" height="1748" alt="mermaid-diagram" src="https://github.com/user-attachments/assets/ee19b702-ab77-47ac-9d44-20b48980dd3a" />
 
-    B --> E[Sensor Processing]
-    E --> F[Rain Duration Tracking]
-    E --> G[Pressure Trend Check]
-    F --> H[Rule-Based Risk Scoring]
-    G --> H
-    E --> H
-
-    H --> I{Risk Level}
-    I -->|Low: below 40| J[Normal Monitoring]
-    I -->|Moderate: 40 to 69| K[LED ON]
-    I -->|High: 70 or above| L[LED ON + Repeating Buzzer]
-
-    B --> M[Wi-Fi Connection]
-    M --> N[ThingSpeak HTTP Update]
-    N --> O[Cloud Dashboard and Historical Data]
-
-    P[NTP Time Server] -->|Time synchronization| B
-```
 Architecture layers
 Layer	Components	Responsibility
 Sensing	Rain sensor, DHT11, BMP280	Collect environmental measurements
